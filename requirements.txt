@@ -1,7 +1,7 @@
-pandas
-ta
-matplotlib
-aiogram
 tinkoff-investments
+pandas
+matplotlib
+ta
 xgboost
+aiogram
 pytz
