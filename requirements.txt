@@ -1,0 +1,7 @@
+pandas
+ta
+matplotlib
+aiogram
+tinkoff-investments
+xgboost
+pytz
