@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import ta
 import time
@@ -10,6 +11,10 @@ from aiogram import Bot
 from tinkoff.invest import Client, CandleInterval
 from xgboost import XGBClassifier
 from config import TELEGRAM_TOKEN, CHAT_ID, STOP_LOSS_PCT, TAKE_PROFIT_PCT, TINKOFF_TOKEN, TINKOFF_FIGI
+
+# ==== Проверка токена Tinkoff ====
+if not TINKOFF_TOKEN or not TINKOFF_TOKEN.startswith("t."):
+    raise ValueError("❌ Ошибка: переменная окружения TINKOFF_TOKEN не задана или имеет неверный формат.")
 
 # ===== Получение цены =====
 def get_rub_cny_price():
@@ -94,6 +99,7 @@ def save_signal_to_csv(signal, price, sl, tp, forecast, ema5=None, ema20=None, r
 
 # ===== Построение графика =====
 def plot_chart(df, signal, price, sl, tp, forecast):
+    os.makedirs("charts", exist_ok=True)  # <-- создаём папку charts
     plt.figure(figsize=(8, 4))
     plt.plot(df["close"], label="Цена", color="black")
     plt.plot(df["ema_fast"], label="EMA(5)", color="blue")
