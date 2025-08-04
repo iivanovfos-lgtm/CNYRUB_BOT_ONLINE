@@ -1,5 +1,5 @@
 import os# Данные для торговли
-TINKOFF_TOKEN = "t.ТВОЙ_БОЕВОЙ_ТОКЕН"
+TINKOFF_TOKEN = "t.XXXXXXXXXXXXXX"
 ACCOUNT_ID = "2183827266"
 TINKOFF_FIGI = "BBG0013HRTL0"
 
@@ -10,5 +10,6 @@ CHAT_ID = "твой_chat_id"
 # Торговые параметры
 STOP_LOSS_PCT = 0.1    # 0.1% стоп-лосс
 TAKE_PROFIT_PCT = 0.2  # 0.2% тейк-профит
+
 
 
