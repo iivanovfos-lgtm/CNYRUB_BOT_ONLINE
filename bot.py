@@ -9,16 +9,18 @@ from datetime import datetime, timedelta
 import pytz
 from aiogram import Bot
 from aiogram.types import FSInputFile
-from tinkoff.invest import Client, CandleInterval
-from xgboost import XGBClassifier
-from config import TELEGRAM_TOKEN, CHAT_ID, STOP_LOSS_PCT, TAKE_PROFIT_PCT, TINKOFF_TOKEN, TINKOFF_FIGI
+from tinkoff.invest import Client, OrderDirection, OrderType, CandleInterval, StopOrderDirection, StopOrderExpirationType, StopOrderType
+from config import TELEGRAM_TOKEN, CHAT_ID, STOP_LOSS_PCT, TAKE_PROFIT_PCT, TINKOFF_TOKEN, TINKOFF_FIGI, ACCOUNT_ID
 
-# ==== Московский часовой пояс ====
+# Московское время
 moscow_tz = pytz.timezone("Europe/Moscow")
 
-# ==== Проверка токена Tinkoff ====
-if not TINKOFF_TOKEN or not TINKOFF_TOKEN.startswith("t."):
-    raise ValueError("❌ Ошибка: переменная окружения TINKOFF_TOKEN не задана или имеет неверный формат.")
+# Торговый объём
+LOT_SIZE = 1  # минимальный размер лота RUB/CNY
+
+# Текущая позиция
+current_position = None
+entry_price = None
 
 # ===== Получение цены =====
 def get_rub_cny_price():
@@ -32,12 +34,9 @@ def get_rub_cny_price():
                 interval=CandleInterval.CANDLE_INTERVAL_1_MIN
             )
             if not candles.candles:
-                print("[WARNING] Свечи не найдены")
                 return None
-
             last_candle = candles.candles[-1]
-            price = last_candle.close.units + last_candle.close.nano / 1e9
-            return float(price)
+            return last_candle.close.units + last_candle.close.nano / 1e9
     except Exception as e:
         print(f"[Ошибка получения цены] {e}")
         return None
@@ -57,104 +56,99 @@ def generate_signal(prices: list):
             return "SELL", df
     return "HOLD", df
 
-# ===== Обучение XGBoost =====
-def train_xgb(prices: list):
-    if len(prices) < 10:
-        return None
-    df = pd.DataFrame(prices, columns=["close"])
-    df["return"] = df["close"].pct_change()
-    df["ema_fast"] = ta.trend.ema_indicator(df["close"], window=5)
-    df["ema_slow"] = ta.trend.ema_indicator(df["close"], window=20)
-    df["rsi"] = ta.momentum.rsi(df["close"], window=14)
-    df["volatility"] = df["return"].rolling(5).std()
-    df.dropna(inplace=True)
-    X = df[["return", "ema_fast", "ema_slow", "rsi", "volatility"]]
-    y = (df["close"].shift(-3) > df["close"]).astype(int).dropna()
-    X = X.iloc[:-3]
-    if len(y.unique()) < 2:
-        return None
-    model = XGBClassifier(use_label_encoder=False, eval_metric="logloss")
-    model.fit(X, y)
-    return model
+# ===== Выставление рыночного ордера =====
+def place_market_order(direction: str, quantity: int):
+    with Client(TINKOFF_TOKEN) as client:
+        dir_enum = OrderDirection.ORDER_DIRECTION_BUY if direction == "BUY" else OrderDirection.ORDER_DIRECTION_SELL
+        order = client.orders.post_order(
+            figi=TINKOFF_FIGI,
+            quantity=quantity,
+            direction=dir_enum,
+            account_id=ACCOUNT_ID,
+            order_type=OrderType.ORDER_TYPE_MARKET,
+            order_id=f"bot-order-{datetime.now().timestamp()}"
+        )
+        return order
 
-# ===== Прогноз XGBoost =====
-def predict_xgb(model, prices: list):
-    if model is None:
-        return None
-    df = pd.DataFrame(prices, columns=["close"])
-    df["return"] = df["close"].pct_change()
-    df["ema_fast"] = ta.trend.ema_indicator(df["close"], window=5)
-    df["ema_slow"] = ta.trend.ema_indicator(df["close"], window=20)
-    df["rsi"] = ta.momentum.rsi(df["close"], window=14)
-    df["volatility"] = df["return"].rolling(5).std()
-    last_row = df.dropna().iloc[-1:][["return", "ema_fast", "ema_slow", "rsi", "volatility"]]
-    prob = model.predict_proba(last_row)[0]
-    return round(prob[1] * 100, 1), round(prob[0] * 100, 1)
+# ===== Выставление стоп-ордеров (SL/TP) =====
+def place_stop_orders(entry_price, direction):
+    with Client(TINKOFF_TOKEN) as client:
+        if direction == "BUY":
+            stop_loss_price = entry_price * (1 - STOP_LOSS_PCT / 100)
+            take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT / 100)
+            stop_dir = StopOrderDirection.STOP_ORDER_DIRECTION_SELL
+        else:  # SELL
+            stop_loss_price = entry_price * (1 + STOP_LOSS_PCT / 100)
+            take_profit_price = entry_price * (1 - TAKE_PROFIT_PCT / 100)
+            stop_dir = StopOrderDirection.STOP_ORDER_DIRECTION_BUY
 
-# ===== Сохранение сигнала =====
-def save_signal_to_csv(signal, price, sl, tp, forecast, ema5=None, ema20=None, rsi=None):
-    with open("signals.csv", mode="a", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
+        # Stop Loss
+        client.stop_orders.post_stop_order(
+            figi=TINKOFF_FIGI,
+            quantity=LOT_SIZE,
+            price=stop_loss_price,
+            stop_price=stop_loss_price,
+            direction=stop_dir,
+            account_id=ACCOUNT_ID,
+            expiration_type=StopOrderExpirationType.STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL,
+            stop_order_type=StopOrderType.STOP_ORDER_TYPE_STOP_LIMIT
+        )
+
+        # Take Profit
+        client.stop_orders.post_stop_order(
+            figi=TINKOFF_FIGI,
+            quantity=LOT_SIZE,
+            price=take_profit_price,
+            stop_price=take_profit_price,
+            direction=stop_dir,
+            account_id=ACCOUNT_ID,
+            expiration_type=StopOrderExpirationType.STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL,
+            stop_order_type=StopOrderType.STOP_ORDER_TYPE_TAKE_PROFIT
+        )
+
+# ===== Журнал сделок =====
+def log_trade(action, price, profit=None):
+    with open("trades.csv", "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
         writer.writerow([
             datetime.now(moscow_tz).strftime("%Y-%m-%d %H:%M:%S"),
-            price, signal, sl, tp, f"{forecast}",
-            ema5, ema20, rsi
+            action, price, profit
         ])
 
-# ===== Построение графика =====
-def plot_chart(df, signal, price, sl, tp, forecast):
-    os.makedirs("charts", exist_ok=True)  # Создаём папку charts
+# ===== График =====
+def plot_chart(df, signal, price):
+    os.makedirs("charts", exist_ok=True)
     plt.figure(figsize=(8, 4))
     plt.plot(df["close"], label="Цена", color="black")
     plt.plot(df["ema_fast"], label="EMA(5)", color="blue")
     plt.plot(df["ema_slow"], label="EMA(20)", color="red")
     if signal == "BUY":
-        plt.scatter(len(df) - 1, price, color="green", label="BUY", zorder=5)
+        plt.scatter(len(df) - 1, price, color="green", label="BUY")
     elif signal == "SELL":
-        plt.scatter(len(df) - 1, price, color="red", label="SELL", zorder=5)
-    plt.axhline(sl, color="orange", linestyle="--", label="Stop Loss")
-    plt.axhline(tp, color="purple", linestyle="--", label="Take Profit")
-    plt.title(f"RUB/CNY — {signal}", fontsize=14)
-    if forecast:
-        plt.text(0.02, 0.95, f"Прогноз: рост {forecast[0]}% / падение {forecast[1]}%",
-                 transform=plt.gca().transAxes,
-                 fontsize=10, bbox=dict(facecolor="white", alpha=0.7))
+        plt.scatter(len(df) - 1, price, color="red", label="SELL")
     plt.legend()
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.tight_layout()
     plt.savefig("charts/chart.png")
     plt.close()
 
-# ===== Отправка сигнала =====
-async def send_signal(signal, price, sl, tp, forecast, ema5=None, ema20=None, rsi=None, is_start=False):
+# ===== Telegram =====
+async def send_signal_with_chart(signal, price):
     bot = Bot(token=TELEGRAM_TOKEN)
-    forecast_text = f"📊 Прогноз: рост — {forecast[0]}%, падение — {forecast[1]}%" if forecast else ""
-    ema_text = (
-        f"📈 EMA5: {ema5:.5f} | EMA20: {ema20:.5f} | RSI: {rsi:.2f}"
-        if ema5 is not None and ema20 is not None and rsi is not None
-        else "📈 EMA/RSI: нет данных"
-    )
-    header = "🚀 Стартовый сигнал" if is_start else f"📌 Сигнал: {signal}"
-    msg = (
-        f"📊 RUB/CNY: {price:.5f}\n"
-        f"{header}\n"
-        f"🛑 Stop Loss: {sl:.5f}\n"
-        f"🎯 Take Profit: {tp:.5f}\n"
-        f"{forecast_text}\n"
-        f"{ema_text}\n"
-        f"⏱ Время: {datetime.now(moscow_tz).strftime('%H:%M:%S')}"
-    )
+    photo = FSInputFile("charts/chart.png")
+    await bot.send_photo(CHAT_ID, photo, caption=f"{signal} @ {price:.5f}")
+    await bot.session.close()
 
-    await bot.send_message(CHAT_ID, msg)
-    photo = FSInputFile("charts/chart.png")  # Исправлено для aiogram 3.x
-    await bot.send_photo(CHAT_ID, photo)
+async def send_telegram_message(text):
+    bot = Bot(token=TELEGRAM_TOKEN)
+    await bot.send_message(CHAT_ID, text)
     await bot.session.close()
 
 # ===== Основной цикл =====
 def main():
+    global current_position, entry_price
     prices = []
     first_run = True
-    last_signal = None
 
     while True:
         price = get_rub_cny_price()
@@ -167,27 +161,31 @@ def main():
             prices = prices[-60:]
 
         signal, df = generate_signal(prices)
-        sl = price * (1 - STOP_LOSS_PCT / 100) if signal == "BUY" else price * (1 + STOP_LOSS_PCT / 100)
-        tp = price * (1 + TAKE_PROFIT_PCT / 100) if signal == "BUY" else price * (1 - TAKE_PROFIT_PCT / 100)
+        plot_chart(df, signal, price)
 
-        model = train_xgb(prices)
-        forecast = predict_xgb(model, prices)
-
-        last = df.iloc[-1]
-        ema5_val = last["ema_fast"] if pd.notna(last["ema_fast"]) else None
-        ema20_val = last["ema_slow"] if pd.notna(last["ema_slow"]) else None
-        rsi_val = last["rsi"] if pd.notna(last["rsi"]) else None
-
-        plot_chart(df, signal, price, sl, tp, forecast)
-
-        if first_run or signal != last_signal:
-            asyncio.run(send_signal(signal, price, sl, tp, forecast,
-                                    ema5=ema5_val, ema20=ema20_val, rsi=rsi_val,
-                                    is_start=first_run))
-            save_signal_to_csv(signal, price, sl, tp, forecast,
-                               ema5=ema5_val, ema20=ema20_val, rsi=rsi_val)
-            last_signal = signal
+        if first_run:
+            asyncio.run(send_signal_with_chart(f"🚀 Стартовый сигнал {signal}", price))
             first_run = False
+
+        # Автоторговля
+        if signal in ["BUY", "SELL"] and signal != current_position:
+            # Закрываем старую позицию
+            if current_position is not None:
+                current_position = None
+
+            # Открываем новую
+            place_market_order(signal, LOT_SIZE)
+            entry_price = price
+            current_position = signal
+            log_trade(f"OPEN {signal}", price)
+            asyncio.run(send_telegram_message(f"🟢 Открыта {signal} @ {price:.5f}"))
+
+            # Ставим реальные SL и TP
+            place_stop_orders(entry_price, signal)
+            asyncio.run(send_telegram_message(
+                f"📌 Stop Loss: {entry_price * (1 - STOP_LOSS_PCT / 100 if signal == 'BUY' else 1 + STOP_LOSS_PCT / 100):.5f}\n"
+                f"📌 Take Profit: {entry_price * (1 + TAKE_PROFIT_PCT / 100 if signal == 'BUY' else 1 - TAKE_PROFIT_PCT / 100):.5f}"
+            ))
 
         time.sleep(60)
 
