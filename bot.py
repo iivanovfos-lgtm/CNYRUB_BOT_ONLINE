@@ -8,9 +8,13 @@ import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import pytz
 from aiogram import Bot
+from aiogram.types import FSInputFile
 from tinkoff.invest import Client, CandleInterval
 from xgboost import XGBClassifier
 from config import TELEGRAM_TOKEN, CHAT_ID, STOP_LOSS_PCT, TAKE_PROFIT_PCT, TINKOFF_TOKEN, TINKOFF_FIGI
+
+# ==== Московский часовой пояс ====
+moscow_tz = pytz.timezone("Europe/Moscow")
 
 # ==== Проверка токена Tinkoff ====
 if not TINKOFF_TOKEN or not TINKOFF_TOKEN.startswith("t."):
@@ -92,14 +96,14 @@ def save_signal_to_csv(signal, price, sl, tp, forecast, ema5=None, ema20=None, r
     with open("signals.csv", mode="a", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
         writer.writerow([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            datetime.now(moscow_tz).strftime("%Y-%m-%d %H:%M:%S"),
             price, signal, sl, tp, f"{forecast}",
             ema5, ema20, rsi
         ])
 
 # ===== Построение графика =====
 def plot_chart(df, signal, price, sl, tp, forecast):
-    os.makedirs("charts", exist_ok=True)  # <-- создаём папку charts
+    os.makedirs("charts", exist_ok=True)  # Создаём папку charts
     plt.figure(figsize=(8, 4))
     plt.plot(df["close"], label="Цена", color="black")
     plt.plot(df["ema_fast"], label="EMA(5)", color="blue")
@@ -138,11 +142,12 @@ async def send_signal(signal, price, sl, tp, forecast, ema5=None, ema20=None, rs
         f"🎯 Take Profit: {tp:.5f}\n"
         f"{forecast_text}\n"
         f"{ema_text}\n"
-        f"⏱ Время: {datetime.now().strftime('%H:%M:%S')}"
+        f"⏱ Время: {datetime.now(moscow_tz).strftime('%H:%M:%S')}"
     )
+
     await bot.send_message(CHAT_ID, msg)
-    with open("charts/chart.png", "rb") as photo:
-        await bot.send_photo(CHAT_ID, photo)
+    photo = FSInputFile("charts/chart.png")  # Исправлено для aiogram 3.x
+    await bot.send_photo(CHAT_ID, photo)
     await bot.session.close()
 
 # ===== Основной цикл =====
