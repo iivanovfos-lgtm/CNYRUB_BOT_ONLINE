@@ -15,6 +15,7 @@ from tinkoff.invest import Client, OrderDirection, OrderType, CandleInterval
 # === Настройки торговли из Environment Variables ===
 TRADE_LOTS = int(os.getenv("TRADE_LOTS", 1))  # Лоты по умолчанию 1
 TRADE_RUB_LIMIT = float(os.getenv("TRADE_RUB_LIMIT", 10000))  # Лимит в рублях по умолчанию 10 000
+MIN_POSITION_THRESHOLD = 0.5  # Минимум лота, при котором считаем, что позиция открыта
 
 moscow_tz = pytz.timezone("Europe/Moscow")
 current_position = None
@@ -36,7 +37,7 @@ def get_current_position():
     with Client(TINKOFF_TOKEN) as client:
         portfolio = client.operations.get_portfolio(account_id=ACCOUNT_ID)
         for pos in portfolio.positions:
-            # CNY — это всегда валюта, но не рубль
+            # CNY — это валюта, но не рубль
             if pos.instrument_type == "currency" and pos.figi != "FG0000000000":
                 return float(pos.quantity.units)
     return 0
@@ -158,8 +159,8 @@ def place_market_order(direction, current_price):
 
     # BUY
     if direction == "BUY":
-        if current_balance > 0:
-            print("[INFO] Уже есть открытая покупка — новый BUY не нужен")
+        if current_balance > MIN_POSITION_THRESHOLD:
+            print(f"[INFO] Уже есть открытая покупка ({current_balance} CNY) — новый BUY не нужен")
             return None
         if trade_amount_rub > TRADE_RUB_LIMIT:
             print(f"[INFO] Сделка на {trade_amount_rub:.2f} ₽ превышает лимит {TRADE_RUB_LIMIT:.2f} ₽ — пропуск")
@@ -173,7 +174,7 @@ def place_market_order(direction, current_price):
 
     # SELL
     elif direction == "SELL":
-        if current_balance <= 0:
+        if current_balance <= MIN_POSITION_THRESHOLD:
             print("[INFO] Нет позиции для продажи — пропуск SELL")
             return None
         order_dir = OrderDirection.ORDER_DIRECTION_SELL
