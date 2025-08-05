@@ -115,10 +115,14 @@ def place_market_order(direction, current_price):
         qty = TRADE_LOTS
 
     elif direction == "SELL":
-        if cny_balance < TRADE_LOTS:
+        if cny_balance < MIN_POSITION_THRESHOLD:
+            return None
+        # 🔹 Продаём только то, что есть, не больше
+        qty = min(int(cny_balance), TRADE_LOTS)
+        if qty < 1:
             return None
         order_dir = OrderDirection.ORDER_DIRECTION_SELL
-        qty = int(cny_balance)
+
     else:
         return None
 
