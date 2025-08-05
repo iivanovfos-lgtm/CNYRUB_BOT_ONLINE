@@ -70,7 +70,7 @@ def get_rub_cny_price():
             if not candles.candles:
                 return None
             last_candle = candles.candles[-1]
-            return last_candle.close.units + last_candle.close.nano / 1e9
+            return last_candle.close.units + last_candle.nano / 1e9
     except Exception as e:
         print(f"[Ошибка цены] {e}")
         return None
@@ -150,7 +150,7 @@ async def notify_order_rejected(reason):
 
 # ===== Отправка ордера =====
 def place_market_order(direction, current_price):
-    """Торгуем только в рамках средств на счёте и лимита."""
+    """Только в рамках средств на счёте и без шорта."""
     current_balance = get_current_position()
     rub_balance = get_account_balance()
     trade_amount_rub = current_price * TRADE_LOTS
@@ -167,15 +167,18 @@ def place_market_order(direction, current_price):
             print("[INFO] Недостаточно средств для покупки")
             return None
         order_dir = OrderDirection.ORDER_DIRECTION_BUY
-        print(f"[INFO] Открытие позиции BUY на {TRADE_LOTS} лот(ов)")
+        qty = TRADE_LOTS
+        print(f"[INFO] Открытие позиции BUY на {qty} лот(ов)")
 
     # SELL
     elif direction == "SELL":
         if current_balance <= 0:
-            print("[INFO] Нет позиции для продажи — шортить не будем")
+            print("[INFO] Нет позиции для продажи — пропуск SELL")
             return None
         order_dir = OrderDirection.ORDER_DIRECTION_SELL
-        print(f"[INFO] Закрытие позиции SELL ({current_balance} лот(ов))")
+        qty = int(current_balance)
+        print(f"[INFO] Закрытие позиции SELL ({qty} лот(ов))")
+
     else:
         return None
 
@@ -183,7 +186,7 @@ def place_market_order(direction, current_price):
         try:
             resp = client.orders.post_order(
                 figi=TINKOFF_FIGI,
-                quantity=TRADE_LOTS,
+                quantity=qty,
                 direction=order_dir,
                 account_id=ACCOUNT_ID,
                 order_type=OrderType.ORDER_TYPE_MARKET,
@@ -226,7 +229,7 @@ def main():
         if signal in ["BUY", "SELL"] and signal != current_position:
             resp = place_market_order(signal, price)
             if resp:  # Ордер прошёл
-                current_position = signal
+                current_position = signal if signal == "BUY" else None
                 entry_price = price
                 asyncio.run(send_chart(f"🟢 Открыта {signal}", price, reason, ema5, ema20, rsi))
 
