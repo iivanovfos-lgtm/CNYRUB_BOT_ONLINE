@@ -14,9 +14,11 @@ from aiogram import Bot
 from aiogram.types import FSInputFile
 from tinkoff.invest import Client, OrderDirection, OrderType, CandleInterval
 
+# === Настройки ===
 TRADE_LOTS = int(os.getenv("TRADE_LOTS", 1))
 TRADE_RUB_LIMIT = float(os.getenv("TRADE_RUB_LIMIT", 10000))
 MIN_POSITION_THRESHOLD = 0.5
+LOT_SIZE_CNY = 1000  # 1 лот = 1000 CNY
 
 moscow_tz = pytz.timezone("Europe/Moscow")
 current_position = None
@@ -98,13 +100,18 @@ def generate_signal(prices):
 # ===== Выставление ордера =====
 def place_market_order(direction, current_price):
     rub_balance, cny_balance = get_balances()
-    trade_amount_rub = current_price * TRADE_LOTS
+
+    # Переводим баланс в лоты
+    cny_lots = int(cny_balance // LOT_SIZE_CNY)
+    buy_cny_qty = TRADE_LOTS * LOT_SIZE_CNY
+    trade_amount_rub = current_price * buy_cny_qty
 
     debug_text = (
         f"Направление: {direction}\n"
         f"RUB баланс: {rub_balance:.2f}\n"
-        f"CNY баланс: {cny_balance:.2f}\n"
+        f"CNY баланс: {cny_balance:.2f} ({cny_lots} лотов)\n"
         f"Лоты на сделку: {TRADE_LOTS}\n"
+        f"CNY на покупку: {buy_cny_qty}\n"
         f"Стоимость сделки: {trade_amount_rub:.2f} RUB\n"
         f"Лимит сделки: {TRADE_RUB_LIMIT:.2f} RUB"
     )
@@ -112,19 +119,18 @@ def place_market_order(direction, current_price):
     asyncio.run(send_debug_message(debug_text))
 
     if direction == "BUY":
-        if cny_balance > MIN_POSITION_THRESHOLD:
-            return None
+        if cny_balance >= LOT_SIZE_CNY:
+            return None  # Уже есть лот — не покупаем снова
         if trade_amount_rub > TRADE_RUB_LIMIT or trade_amount_rub > rub_balance:
             return None
         order_dir = OrderDirection.ORDER_DIRECTION_BUY
-        qty = TRADE_LOTS
+        qty = TRADE_LOTS  # указываем в лотах, API сам пересчитает
 
     elif direction == "SELL":
-        if cny_balance < 1:
-            print(f"[INFO] Недостаточно CNY для продажи ({cny_balance})")
+        if cny_balance < LOT_SIZE_CNY:
+            print(f"[INFO] Недостаточно CNY для продажи ({cny_balance}), минимум {LOT_SIZE_CNY}")
             return None
-        # 🔹 Продаём не больше, чем реально есть
-        qty = min(int(cny_balance), TRADE_LOTS)
+        qty = min(cny_lots, TRADE_LOTS)
         if qty < 1:
             return None
         order_dir = OrderDirection.ORDER_DIRECTION_SELL
