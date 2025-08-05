@@ -24,20 +24,20 @@ entry_price = None
 def get_account_balance():
     """Баланс счёта в рублях."""
     with Client(TINKOFF_TOKEN) as client:
-        positions = client.operations.get_positions(account_id=ACCOUNT_ID)
-        for cur in positions.currencies:
-            if cur.currency.lower() == "rub":
-                return cur.balance
+        portfolio = client.operations.get_portfolio(account_id=ACCOUNT_ID)
+        for pos in portfolio.positions:
+            if pos.instrument_type == "currency" and pos.figi == "FG0000000000":  # FIGI рубля
+                return float(pos.quantity.units)
     return 0
 
 # ===== Получаем текущую открытую позицию =====
 def get_current_position():
     """Открытая позиция по RUB/CNY."""
     with Client(TINKOFF_TOKEN) as client:
-        positions = client.operations.get_positions(account_id=ACCOUNT_ID)
-        for cur in positions.currencies:
-            if cur.figi == TINKOFF_FIGI:
-                return cur.balance
+        portfolio = client.operations.get_portfolio(account_id=ACCOUNT_ID)
+        for pos in portfolio.positions:
+            if pos.figi == TINKOFF_FIGI:
+                return float(pos.quantity.units)
     return 0
 
 # ===== Загрузка истории цен =====
