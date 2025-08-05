@@ -14,18 +14,15 @@ from aiogram import Bot
 from aiogram.types import FSInputFile
 from tinkoff.invest import Client, OrderDirection, OrderType, CandleInterval
 
-# === Настройки торговли из Environment Variables ===
 TRADE_LOTS = int(os.getenv("TRADE_LOTS", 1))
 TRADE_RUB_LIMIT = float(os.getenv("TRADE_RUB_LIMIT", 10000))
-MIN_POSITION_THRESHOLD = 0.5  # Минимум CNY, чтобы считать позицию открытой
+MIN_POSITION_THRESHOLD = 0.5
 
 moscow_tz = pytz.timezone("Europe/Moscow")
 current_position = None
 entry_price = None
 
-# ===== Получаем остатки прямо из API =====
 def get_balances():
-    """Возвращает баланс RUB и CNY."""
     rub_balance = 0
     cny_balance = 0
     with Client(TINKOFF_TOKEN) as client:
@@ -37,7 +34,11 @@ def get_balances():
                 cny_balance = float(cur.units)
     return rub_balance, cny_balance
 
-# ===== Загрузка истории цен =====
+async def send_debug_message(text):
+    bot = Bot(token=TELEGRAM_TOKEN)
+    await bot.send_message(CHAT_ID, f"🛠 DEBUG:\n{text}")
+    await bot.session.close()
+
 def load_initial_prices():
     try:
         with Client(TINKOFF_TOKEN) as client:
@@ -52,7 +53,6 @@ def load_initial_prices():
     except:
         return []
 
-# ===== Получение текущей цены =====
 def get_price():
     try:
         with Client(TINKOFF_TOKEN) as client:
@@ -70,7 +70,6 @@ def get_price():
     except:
         return None
 
-# ===== Генерация сигнала =====
 def generate_signal(prices):
     df = pd.DataFrame(prices, columns=["close"])
     df["ema_fast"] = ta.trend.ema_indicator(df["close"], window=5)
@@ -87,74 +86,42 @@ def generate_signal(prices):
             return "SELL", df, "нисходящий тренд", ema5, ema20, rsi
     return "HOLD", df, "нет тренда", ema5, ema20, rsi
 
-# ===== Построение графика =====
-def plot_chart(df, signal, price):
-    if len(df) < 20:
-        return
-    os.makedirs("charts_currency", exist_ok=True)
-    plt.figure(figsize=(8, 4))
-    plt.plot(df["close"], label="Цена", color="black")
-    plt.plot(df["ema_fast"], label="EMA(5)", color="blue")
-    plt.plot(df["ema_slow"], label="EMA(20)", color="red")
-    if signal == "BUY":
-        plt.scatter(len(df) - 1, price, color="green")
-    elif signal == "SELL":
-        plt.scatter(len(df) - 1, price, color="red")
-    plt.legend()
-    plt.grid(True, linestyle="--", alpha=0.5)
-    plt.tight_layout()
-    plt.savefig("charts_currency/chart.png")
-    plt.close()
-
-# ===== Telegram уведомления =====
-async def send_chart(signal, price, reason, ema5, ema20, rsi):
-    bot = Bot(token=TELEGRAM_TOKEN)
-    if os.path.exists("charts_currency/chart.png"):
-        photo = FSInputFile("charts_currency/chart.png")
-        await bot.send_photo(
-            CHAT_ID, photo,
-            caption=f"[RUB/CNY] {signal} @ {price:.5f}\nПричина: {reason}\nEMA5: {ema5:.5f} | EMA20: {ema20:.5f} | RSI: {rsi:.2f}"
-        )
-    else:
-        await bot.send_message(CHAT_ID, f"[RUB/CNY] {signal} @ {price:.5f}")
-    await bot.session.close()
-
 async def notify_order_rejected(reason):
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(CHAT_ID, f"[RUB/CNY] ⚠️ Ордер отклонён!\nПричина: {reason}")
     await bot.session.close()
 
-# ===== Отправка ордера =====
 def place_market_order(direction, current_price):
     rub_balance, cny_balance = get_balances()
     trade_amount_rub = current_price * TRADE_LOTS
 
-    # BUY — покупаем только если хватает RUB
+    debug_text = (
+        f"Направление: {direction}\n"
+        f"RUB баланс: {rub_balance:.2f}\n"
+        f"CNY баланс: {cny_balance:.2f}\n"
+        f"Лоты на сделку: {TRADE_LOTS}\n"
+        f"Стоимость сделки: {trade_amount_rub:.2f} RUB\n"
+        f"Лимит сделки: {TRADE_RUB_LIMIT:.2f} RUB"
+    )
+    print(debug_text)
+    asyncio.run(send_debug_message(debug_text))
+
     if direction == "BUY":
         if cny_balance > MIN_POSITION_THRESHOLD:
-            print(f"[INFO] Уже есть {cny_balance} CNY — новый BUY не нужен")
             return None
-        if trade_amount_rub > TRADE_RUB_LIMIT:
-            print(f"[INFO] Сделка на {trade_amount_rub:.2f} ₽ превышает лимит")
-            return None
-        if trade_amount_rub > rub_balance:
-            print("[INFO] Недостаточно RUB для покупки")
+        if trade_amount_rub > TRADE_RUB_LIMIT or trade_amount_rub > rub_balance:
             return None
         order_dir = OrderDirection.ORDER_DIRECTION_BUY
         qty = TRADE_LOTS
 
-    # SELL — продаём только если хватает CNY
     elif direction == "SELL":
         if cny_balance < TRADE_LOTS:
-            print(f"[INFO] Недостаточно CNY для продажи ({cny_balance})")
             return None
         order_dir = OrderDirection.ORDER_DIRECTION_SELL
         qty = int(cny_balance)
-
     else:
         return None
 
-    # Отправка ордера
     with Client(TINKOFF_TOKEN) as client:
         try:
             resp = client.orders.post_order(
@@ -173,7 +140,6 @@ def place_market_order(direction, current_price):
             asyncio.run(notify_order_rejected(str(e)))
             return None
 
-# ===== Основной цикл =====
 def main():
     global current_position, entry_price
     prices = load_initial_prices()
@@ -190,10 +156,9 @@ def main():
             prices = prices[-60:]
 
         signal, df, reason, ema5, ema20, rsi = generate_signal(prices)
-        plot_chart(df, signal, price)
 
         if first_run:
-            asyncio.run(send_chart(f"🚀 Стартовый сигнал {signal}", price, reason, ema5, ema20, rsi))
+            asyncio.run(send_debug_message(f"🚀 Стартовый сигнал {signal} @ {price:.5f}"))
             first_run = False
 
         if signal in ["BUY", "SELL"] and signal != current_position:
@@ -201,7 +166,7 @@ def main():
             if resp:
                 current_position = signal if signal == "BUY" else None
                 entry_price = price
-                asyncio.run(send_chart(f"🟢 Открыта {signal}", price, reason, ema5, ema20, rsi))
+                asyncio.run(send_debug_message(f"🟢 Открыта {signal} @ {price:.5f}"))
 
         time.sleep(60)
 
