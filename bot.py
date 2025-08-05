@@ -4,7 +4,6 @@ import pandas as pd
 import ta
 import time
 import asyncio
-import csv
 import uuid
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
@@ -12,7 +11,6 @@ import pytz
 from aiogram import Bot
 from aiogram.types import FSInputFile
 from tinkoff.invest import Client, OrderDirection, OrderType, CandleInterval
-from tinkoff.invest.utils import decimal_to_quotation
 
 moscow_tz = pytz.timezone("Europe/Moscow")
 LOT_SIZE = 1
@@ -115,7 +113,16 @@ async def send_chart(signal, price, reason, ema5, ema20, rsi):
 
 async def notify_order_rejected(reason):
     bot = Bot(token=TELEGRAM_TOKEN)
-    await bot.send_message(CHAT_ID, f"[RUB/CNY] ⚠️ Ордер отклонён!\nПричина: {reason}")
+    if "Need confirmation" in reason:
+        await bot.send_message(
+            CHAT_ID,
+            "[RUB/CNY] ⚠️ Сделка не прошла — требуется подтверждение в приложении Тинькофф."
+        )
+    else:
+        await bot.send_message(
+            CHAT_ID,
+            f"[RUB/CNY] ⚠️ Ордер отклонён!\nПричина: {reason}"
+        )
     await bot.session.close()
 
 # ===== Отправка ордера =====
@@ -135,9 +142,9 @@ def place_market_order(direction):
             print(f"[TINKOFF] Ответ API: {resp}")
 
             if resp.execution_report_status.name != "EXECUTION_REPORT_STATUS_FILL":
-                reason = getattr(resp, "message", resp.execution_report_status.name)
+                reason = getattr(resp, "message", str(resp.execution_report_status))
                 print(f"[ВНИМАНИЕ] Ордер не исполнен! Причина: {reason}")
-                asyncio.run(notify_order_rejected(reason))
+                asyncio.run(notify_order_rejected(str(reason)))
                 return None
 
             print("[OK] Ордер исполнен успешно")
