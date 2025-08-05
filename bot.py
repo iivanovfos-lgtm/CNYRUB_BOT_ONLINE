@@ -22,6 +22,7 @@ moscow_tz = pytz.timezone("Europe/Moscow")
 current_position = None
 entry_price = None
 
+# ===== Получаем остатки =====
 def get_balances():
     rub_balance = 0
     cny_balance = 0
@@ -34,11 +35,18 @@ def get_balances():
                 cny_balance = float(cur.units)
     return rub_balance, cny_balance
 
+# ===== Отправка сообщений =====
 async def send_debug_message(text):
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(CHAT_ID, f"🛠 DEBUG:\n{text}")
     await bot.session.close()
 
+async def notify_order_rejected(reason):
+    bot = Bot(token=TELEGRAM_TOKEN)
+    await bot.send_message(CHAT_ID, f"[RUB/CNY] ⚠️ Ордер отклонён!\nПричина: {reason}")
+    await bot.session.close()
+
+# ===== Загрузка цен =====
 def load_initial_prices():
     try:
         with Client(TINKOFF_TOKEN) as client:
@@ -70,6 +78,7 @@ def get_price():
     except:
         return None
 
+# ===== Генерация сигнала =====
 def generate_signal(prices):
     df = pd.DataFrame(prices, columns=["close"])
     df["ema_fast"] = ta.trend.ema_indicator(df["close"], window=5)
@@ -86,11 +95,7 @@ def generate_signal(prices):
             return "SELL", df, "нисходящий тренд", ema5, ema20, rsi
     return "HOLD", df, "нет тренда", ema5, ema20, rsi
 
-async def notify_order_rejected(reason):
-    bot = Bot(token=TELEGRAM_TOKEN)
-    await bot.send_message(CHAT_ID, f"[RUB/CNY] ⚠️ Ордер отклонён!\nПричина: {reason}")
-    await bot.session.close()
-
+# ===== Выставление ордера =====
 def place_market_order(direction, current_price):
     rub_balance, cny_balance = get_balances()
     trade_amount_rub = current_price * TRADE_LOTS
@@ -115,9 +120,10 @@ def place_market_order(direction, current_price):
         qty = TRADE_LOTS
 
     elif direction == "SELL":
-        if cny_balance < MIN_POSITION_THRESHOLD:
+        if cny_balance < 1:
+            print(f"[INFO] Недостаточно CNY для продажи ({cny_balance})")
             return None
-        # 🔹 Продаём только то, что есть, не больше
+        # 🔹 Продаём не больше, чем реально есть
         qty = min(int(cny_balance), TRADE_LOTS)
         if qty < 1:
             return None
@@ -144,6 +150,7 @@ def place_market_order(direction, current_price):
             asyncio.run(notify_order_rejected(str(e)))
             return None
 
+# ===== Основной цикл =====
 def main():
     global current_position, entry_price
     prices = load_initial_prices()
