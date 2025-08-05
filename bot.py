@@ -30,13 +30,14 @@ def get_account_balance():
                 return float(pos.quantity.units)
     return 0
 
-# ===== Получаем текущую открытую позицию =====
+# ===== Получаем текущую открытую позицию (CNY) =====
 def get_current_position():
-    """Открытая позиция по RUB/CNY."""
+    """Возвращаем количество CNY в портфеле."""
     with Client(TINKOFF_TOKEN) as client:
         portfolio = client.operations.get_portfolio(account_id=ACCOUNT_ID)
         for pos in portfolio.positions:
-            if pos.figi == TINKOFF_FIGI:
+            # CNY — это всегда валюта, но не рубль
+            if pos.instrument_type == "currency" and pos.figi != "FG0000000000":
                 return float(pos.quantity.units)
     return 0
 
@@ -70,7 +71,7 @@ def get_rub_cny_price():
             if not candles.candles:
                 return None
             last_candle = candles.candles[-1]
-            return last_candle.close.units + last_candle.nano / 1e9
+            return last_candle.close.units + last_candle.close.nano / 1e9
     except Exception as e:
         print(f"[Ошибка цены] {e}")
         return None
