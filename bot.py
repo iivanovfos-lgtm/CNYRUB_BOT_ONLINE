@@ -12,10 +12,33 @@ from aiogram import Bot
 from aiogram.types import FSInputFile
 from tinkoff.invest import Client, OrderDirection, OrderType, CandleInterval
 
+# === Настройки торговли из Environment Variables ===
+TRADE_LOTS = int(os.getenv("TRADE_LOTS", 1))  # Лоты по умолчанию 1
+TRADE_RUB_LIMIT = float(os.getenv("TRADE_RUB_LIMIT", 10000))  # Лимит в рублях по умолчанию 10 000
+
 moscow_tz = pytz.timezone("Europe/Moscow")
-LOT_SIZE = 1
 current_position = None
 entry_price = None
+
+# ===== Получаем баланс в рублях =====
+def get_account_balance():
+    """Баланс счёта в рублях."""
+    with Client(TINKOFF_TOKEN) as client:
+        positions = client.operations.get_positions(account_id=ACCOUNT_ID)
+        for cur in positions.currencies:
+            if cur.currency.lower() == "rub":
+                return cur.balance
+    return 0
+
+# ===== Получаем текущую открытую позицию =====
+def get_current_position():
+    """Открытая позиция по RUB/CNY."""
+    with Client(TINKOFF_TOKEN) as client:
+        positions = client.operations.get_positions(account_id=ACCOUNT_ID)
+        for cur in positions.currencies:
+            if cur.figi == TINKOFF_FIGI:
+                return cur.balance
+    return 0
 
 # ===== Загрузка истории цен =====
 def load_initial_prices():
@@ -126,32 +149,54 @@ async def notify_order_rejected(reason):
     await bot.session.close()
 
 # ===== Отправка ордера =====
-def place_market_order(direction):
+def place_market_order(direction, current_price):
+    """Торгуем только в рамках средств на счёте и лимита."""
+    current_balance = get_current_position()
+    rub_balance = get_account_balance()
+    trade_amount_rub = current_price * TRADE_LOTS
+
+    # BUY
+    if direction == "BUY":
+        if current_balance > 0:
+            print("[INFO] Уже есть открытая покупка — новый BUY не нужен")
+            return None
+        if trade_amount_rub > TRADE_RUB_LIMIT:
+            print(f"[INFO] Сделка на {trade_amount_rub:.2f} ₽ превышает лимит {TRADE_RUB_LIMIT:.2f} ₽ — пропуск")
+            return None
+        if trade_amount_rub > rub_balance:
+            print("[INFO] Недостаточно средств для покупки")
+            return None
+        order_dir = OrderDirection.ORDER_DIRECTION_BUY
+        print(f"[INFO] Открытие позиции BUY на {TRADE_LOTS} лот(ов)")
+
+    # SELL
+    elif direction == "SELL":
+        if current_balance <= 0:
+            print("[INFO] Нет позиции для продажи — шортить не будем")
+            return None
+        order_dir = OrderDirection.ORDER_DIRECTION_SELL
+        print(f"[INFO] Закрытие позиции SELL ({current_balance} лот(ов))")
+    else:
+        return None
+
     with Client(TINKOFF_TOKEN) as client:
-        dir_enum = OrderDirection.ORDER_DIRECTION_BUY if direction == "BUY" else OrderDirection.ORDER_DIRECTION_SELL
         try:
-            print(f"[TINKOFF] Отправка ордера: {direction}, {LOT_SIZE} лот(ов), FIGI={TINKOFF_FIGI}")
             resp = client.orders.post_order(
                 figi=TINKOFF_FIGI,
-                quantity=LOT_SIZE,
-                direction=dir_enum,
+                quantity=TRADE_LOTS,
+                direction=order_dir,
                 account_id=ACCOUNT_ID,
                 order_type=OrderType.ORDER_TYPE_MARKET,
                 order_id=str(uuid.uuid4())
             )
             print(f"[TINKOFF] Ответ API: {resp}")
-
             if resp.execution_report_status.name != "EXECUTION_REPORT_STATUS_FILL":
                 reason = getattr(resp, "message", str(resp.execution_report_status))
-                print(f"[ВНИМАНИЕ] Ордер не исполнен! Причина: {reason}")
                 asyncio.run(notify_order_rejected(str(reason)))
                 return None
-
-            print("[OK] Ордер исполнен успешно")
+            print("[OK] Ордер исполнен")
             return resp
-
         except Exception as e:
-            print(f"[ОШИБКА] При открытии сделки: {e}")
             asyncio.run(notify_order_rejected(str(e)))
             return None
 
@@ -179,7 +224,7 @@ def main():
             first_run = False
 
         if signal in ["BUY", "SELL"] and signal != current_position:
-            resp = place_market_order(signal)
+            resp = place_market_order(signal, price)
             if resp:  # Ордер прошёл
                 current_position = signal
                 entry_price = price
