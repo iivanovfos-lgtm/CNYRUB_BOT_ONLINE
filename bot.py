@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import pytz
 from aiogram import Bot
 from aiogram.types import FSInputFile
-from tinkoff.invest import Client, OrderDirection, OrderType, CandleInterval, StopOrderDirection, StopOrderExpirationType, StopOrderType
+from tinkoff.invest import Client, OrderDirection, OrderType, CandleInterval
 from tinkoff.invest.utils import decimal_to_quotation
 
 moscow_tz = pytz.timezone("Europe/Moscow")
@@ -73,7 +73,7 @@ def generate_signal(prices):
             return "SELL", df, "нисходящий тренд", ema5, ema20, rsi
     return "HOLD", df, "нет тренда — EMA и RSI в нейтральной зоне", ema5, ema20, rsi
 
-# ===== График =====
+# ===== Построение графика =====
 def plot_chart(df, signal, price):
     if len(df) < 20:
         print("[График] Недостаточно данных для построения")
@@ -93,7 +93,7 @@ def plot_chart(df, signal, price):
     plt.savefig("charts_currency/chart.png")
     plt.close()
 
-# ===== Telegram =====
+# ===== Telegram уведомления =====
 async def send_chart(signal, price, reason, ema5, ema20, rsi):
     bot = Bot(token=TELEGRAM_TOKEN)
     if os.path.exists("charts_currency/chart.png"):
@@ -112,6 +112,41 @@ async def send_chart(signal, price, reason, ema5, ema20, rsi):
             f"EMA(5): {ema5:.5f} | EMA(20): {ema20:.5f} | RSI: {rsi:.2f}"
         )
     await bot.session.close()
+
+async def notify_order_rejected(reason):
+    bot = Bot(token=TELEGRAM_TOKEN)
+    await bot.send_message(CHAT_ID, f"[RUB/CNY] ⚠️ Ордер отклонён!\nПричина: {reason}")
+    await bot.session.close()
+
+# ===== Отправка ордера =====
+def place_market_order(direction):
+    with Client(TINKOFF_TOKEN) as client:
+        dir_enum = OrderDirection.ORDER_DIRECTION_BUY if direction == "BUY" else OrderDirection.ORDER_DIRECTION_SELL
+        try:
+            print(f"[TINKOFF] Отправка ордера: {direction}, {LOT_SIZE} лот(ов), FIGI={TINKOFF_FIGI}")
+            resp = client.orders.post_order(
+                figi=TINKOFF_FIGI,
+                quantity=LOT_SIZE,
+                direction=dir_enum,
+                account_id=ACCOUNT_ID,
+                order_type=OrderType.ORDER_TYPE_MARKET,
+                order_id=str(uuid.uuid4())
+            )
+            print(f"[TINKOFF] Ответ API: {resp}")
+
+            if resp.execution_report_status.name != "EXECUTION_REPORT_STATUS_FILL":
+                reason = getattr(resp, "message", resp.execution_report_status.name)
+                print(f"[ВНИМАНИЕ] Ордер не исполнен! Причина: {reason}")
+                asyncio.run(notify_order_rejected(reason))
+                return None
+
+            print("[OK] Ордер исполнен успешно")
+            return resp
+
+        except Exception as e:
+            print(f"[ОШИБКА] При открытии сделки: {e}")
+            asyncio.run(notify_order_rejected(str(e)))
+            return None
 
 # ===== Основной цикл =====
 def main():
@@ -137,9 +172,11 @@ def main():
             first_run = False
 
         if signal in ["BUY", "SELL"] and signal != current_position:
-            current_position = signal
-            entry_price = price
-            asyncio.run(send_chart(f"🟢 Открыта {signal}", price, reason, ema5, ema20, rsi))
+            resp = place_market_order(signal)
+            if resp:  # Ордер прошёл
+                current_position = signal
+                entry_price = price
+                asyncio.run(send_chart(f"🟢 Открыта {signal}", price, reason, ema5, ema20, rsi))
 
         time.sleep(60)
 
