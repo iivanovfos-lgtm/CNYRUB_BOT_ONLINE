@@ -7,22 +7,26 @@ import ta
 import time
 import asyncio
 import uuid
-import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import pytz
 from aiogram import Bot
-from aiogram.types import FSInputFile
 from tinkoff.invest import Client, OrderDirection, OrderType, CandleInterval
 
 # === Настройки ===
 TRADE_LOTS = int(os.getenv("TRADE_LOTS", 1))
 TRADE_RUB_LIMIT = float(os.getenv("TRADE_RUB_LIMIT", 10000))
-MIN_POSITION_THRESHOLD = 0.5
 LOT_SIZE_CNY = 1000  # 1 лот = 1000 CNY
+TP_PERCENT = 0.3     # Take Profit %
+SL_PERCENT = 0.2     # Stop Loss %
+BROKER_FEE = 0.003   # 0.3% комиссия брокера
+MIN_POSITION_THRESHOLD = 0.5
 
 moscow_tz = pytz.timezone("Europe/Moscow")
+
 current_position = None
 entry_price = None
+take_profit_price = None
+stop_loss_price = None
 
 # ===== Получаем остатки =====
 def get_balances():
@@ -37,18 +41,16 @@ def get_balances():
                 cny_balance = float(cur.units)
     return rub_balance, cny_balance
 
-# ===== Отправка сообщений =====
-async def send_debug_message(text):
+# ===== Telegram =====
+async def send_message(text):
     bot = Bot(token=TELEGRAM_TOKEN)
-    await bot.send_message(CHAT_ID, f"🛠 DEBUG:\n{text}")
+    await bot.send_message(CHAT_ID, text)
     await bot.session.close()
 
 async def notify_order_rejected(reason):
-    bot = Bot(token=TELEGRAM_TOKEN)
-    await bot.send_message(CHAT_ID, f"[RUB/CNY] ⚠️ Ордер отклонён!\nПричина: {reason}")
-    await bot.session.close()
+    await send_message(f"[RUB/CNY] ⚠️ Ордер отклонён!\nПричина: {reason}")
 
-# ===== Загрузка цен =====
+# ===== Цены =====
 def load_initial_prices():
     try:
         with Client(TINKOFF_TOKEN) as client:
@@ -80,7 +82,7 @@ def get_price():
     except:
         return None
 
-# ===== Генерация сигнала =====
+# ===== Сигналы =====
 def generate_signal(prices):
     df = pd.DataFrame(prices, columns=["close"])
     df["ema_fast"] = ta.trend.ema_indicator(df["close"], window=5)
@@ -92,49 +94,34 @@ def generate_signal(prices):
 
     if pd.notna(ema5) and pd.notna(ema20):
         if ema5 > ema20 and rsi < 70:
-            return "BUY", df, "восходящий тренд", ema5, ema20, rsi
+            return "BUY", "восходящий тренд", ema5, ema20, rsi
         elif ema5 < ema20 and rsi > 30:
-            return "SELL", df, "нисходящий тренд", ema5, ema20, rsi
-    return "HOLD", df, "нет тренда", ema5, ema20, rsi
+            return "SELL", "нисходящий тренд", ema5, ema20, rsi
+    return "HOLD", "нет тренда", ema5, ema20, rsi
 
-# ===== Выставление ордера =====
+# ===== Ордера =====
 def place_market_order(direction, current_price):
     rub_balance, cny_balance = get_balances()
 
-    # Переводим баланс в лоты
     cny_lots = int(cny_balance // LOT_SIZE_CNY)
     buy_cny_qty = TRADE_LOTS * LOT_SIZE_CNY
     trade_amount_rub = current_price * buy_cny_qty
 
-    debug_text = (
-        f"Направление: {direction}\n"
-        f"RUB баланс: {rub_balance:.2f}\n"
-        f"CNY баланс: {cny_balance:.2f} ({cny_lots} лотов)\n"
-        f"Лоты на сделку: {TRADE_LOTS}\n"
-        f"CNY на покупку: {buy_cny_qty}\n"
-        f"Стоимость сделки: {trade_amount_rub:.2f} RUB\n"
-        f"Лимит сделки: {TRADE_RUB_LIMIT:.2f} RUB"
-    )
-    print(debug_text)
-    asyncio.run(send_debug_message(debug_text))
-
     if direction == "BUY":
         if cny_balance >= LOT_SIZE_CNY:
-            return None  # Уже есть лот — не покупаем снова
+            return None
         if trade_amount_rub > TRADE_RUB_LIMIT or trade_amount_rub > rub_balance:
             return None
         order_dir = OrderDirection.ORDER_DIRECTION_BUY
-        qty = TRADE_LOTS  # указываем в лотах, API сам пересчитает
+        qty = TRADE_LOTS
 
     elif direction == "SELL":
         if cny_balance < LOT_SIZE_CNY:
-            print(f"[INFO] Недостаточно CNY для продажи ({cny_balance}), минимум {LOT_SIZE_CNY}")
             return None
         qty = min(cny_lots, TRADE_LOTS)
         if qty < 1:
             return None
         order_dir = OrderDirection.ORDER_DIRECTION_SELL
-
     else:
         return None
 
@@ -158,7 +145,7 @@ def place_market_order(direction, current_price):
 
 # ===== Основной цикл =====
 def main():
-    global current_position, entry_price
+    global current_position, entry_price, take_profit_price, stop_loss_price
     prices = load_initial_prices()
     first_run = True
 
@@ -172,18 +159,48 @@ def main():
         if len(prices) > 60:
             prices = prices[-60:]
 
-        signal, df, reason, ema5, ema20, rsi = generate_signal(prices)
+        signal, reason, ema5, ema20, rsi = generate_signal(prices)
 
+        # === Проверка TP/SL ===
+        if current_position == "BUY":
+            if price >= take_profit_price:
+                asyncio.run(send_message(f"[RUB/CNY] 🎯 Take Profit достигнут @ {price:.5f}"))
+                place_market_order("SELL", price)
+                current_position = None
+                continue
+            elif price <= stop_loss_price:
+                asyncio.run(send_message(f"[RUB/CNY] 🛑 Stop Loss достигнут @ {price:.5f}"))
+                place_market_order("SELL", price)
+                current_position = None
+                continue
+
+        # === Новый вход ===
         if first_run:
-            asyncio.run(send_debug_message(f"🚀 Стартовый сигнал {signal} @ {price:.5f}"))
+            asyncio.run(send_message(f"🚀 Стартовый сигнал {signal} @ {price:.5f}"))
             first_run = False
 
-        if signal in ["BUY", "SELL"] and signal != current_position:
-            resp = place_market_order(signal, price)
+        if signal == "BUY" and current_position != "BUY":
+            resp = place_market_order("BUY", price)
             if resp:
-                current_position = signal if signal == "BUY" else None
+                current_position = "BUY"
                 entry_price = price
-                asyncio.run(send_debug_message(f"🟢 Открыта {signal} @ {price:.5f}"))
+
+                # === Цена входа с учётом комиссии брокера (на покупку и продажу) ===
+                total_fee = BROKER_FEE * 2  # покупка + продажа
+                entry_price_with_fee = entry_price * (1 + total_fee)
+
+                take_profit_price = entry_price_with_fee * (1 + TP_PERCENT / 100)
+                stop_loss_price = entry_price_with_fee * (1 - SL_PERCENT / 100)
+
+                asyncio.run(send_message(
+                    f"[RUB/CNY] 🟢 Открыта BUY @ {price:.5f}\n"
+                    f"TP: {take_profit_price:.5f} | SL: {stop_loss_price:.5f} (учтена комиссия {BROKER_FEE*100:.2f}% с каждой сделки)"
+                ))
+
+        elif signal == "SELL" and current_position == "BUY":
+            asyncio.run(send_message(f"[RUB/CNY] 📉 Тренд развернулся — SELL @ {price:.5f}"))
+            place_market_order("SELL", price)
+            current_position = None
 
         time.sleep(60)
 
