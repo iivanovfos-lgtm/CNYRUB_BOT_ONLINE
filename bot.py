@@ -7,6 +7,7 @@ import pandas as pd
 import ta
 import pytz
 from aiogram import Bot
+from aiogram.client.default import DefaultBotProperties  # ✅ для parse_mode
 from tinkoff.invest import Client, OrderDirection, OrderType, CandleInterval
 
 # ==== Настройки ====
@@ -36,20 +37,14 @@ morning_forecast_sent = False
 last_intermediate_report = None
 INTERMEDIATE_INTERVAL_HOURS = 3
 
-# ==== Дневная статистика ====
-daily_profit = 0.0
-daily_commission = 0.0
-daily_buy_count = 0
-daily_sell_count = 0
-start_of_day_portfolio_value = None
-
-
 # ==== Telegram ====
 async def send_message(text):
-    bot = Bot(token=TELEGRAM_TOKEN, parse_mode="Markdown")
+    bot = Bot(
+        token=TELEGRAM_TOKEN,
+        default=DefaultBotProperties(parse_mode="Markdown")
+    )
     await bot.send_message(CHAT_ID, text)
     await bot.session.close()
-
 
 # ==== Новости ====
 async def get_news():
@@ -68,7 +63,6 @@ async def get_news():
             continue
     return "\n".join(news_list)
 
-
 # ==== Баланс ====
 def get_balances():
     rub_balance, cny_balance = 0, 0
@@ -80,7 +74,6 @@ def get_balances():
             elif cur.currency == "cny":
                 cny_balance = float(cur.units)
     return rub_balance, cny_balance
-
 
 # ==== Цена ====
 def get_price():
@@ -97,7 +90,6 @@ def get_price():
         last = candles.candles[-1]
         return last.close.units + last.close.nano / 1e9
 
-
 # ==== Сигнал ====
 def generate_signal(prices):
     df = pd.DataFrame(prices, columns=["close"])
@@ -112,7 +104,6 @@ def generate_signal(prices):
             return "SELL"
     return "HOLD"
 
-
 # ==== Ордер ====
 def place_market_order(direction, qty):
     with Client(TINKOFF_TOKEN) as client:
@@ -125,7 +116,6 @@ def place_market_order(direction, qty):
             order_id=str(uuid.uuid4())
         )
         return resp
-
 
 # ==== Промежуточный отчёт ====
 async def intermediate_report(price):
@@ -149,7 +139,6 @@ async def intermediate_report(price):
             f"Портфель: {portfolio_value:.2f} ₽"
         )
 
-
 # ==== Утренний прогноз ====
 async def morning_forecast(prices):
     signal = generate_signal(prices)
@@ -159,7 +148,6 @@ async def morning_forecast(prices):
         f"Сигнал: {signal}\n\n"
         f"📰 Новости:\n{news_text}"
     )
-
 
 # ==== Основной цикл ====
 def main():
@@ -183,7 +171,6 @@ def main():
             if now.hour == 9 and 55 <= now.minute <= 56 and not morning_forecast_sent:
                 asyncio.run(morning_forecast(prices))
                 morning_forecast_sent = True
-
             if now.hour == 0:
                 morning_forecast_sent = False  # сброс на следующий день
 
@@ -226,7 +213,6 @@ def main():
                     ))
 
         time.sleep(60)
-
 
 if __name__ == "__main__":
     main()
