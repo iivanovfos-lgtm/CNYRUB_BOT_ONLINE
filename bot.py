@@ -27,11 +27,11 @@ BROKER_FEE = 0.0005
 moscow_tz = pytz.timezone("Europe/Moscow")
 POSITION_FILE = "open_position.json"
 
-# ==== Ручная настройка стартовой позиции ====
-MANUAL_POSITION = True  # True = бот считает, что позиция уже открыта
-MANUAL_DIRECTION = "BUY"  # BUY или SELL
-MANUAL_ENTRY_PRICE = 11.1200  # Цена входа
-MANUAL_LOTS = 4  # Количество лотов (4001 ¥ ≈ 4 лота по 1000)
+# ==== Ручная стартовая позиция ====
+MANUAL_POSITION = True
+MANUAL_DIRECTION = "BUY"
+MANUAL_ENTRY_PRICE = 11.1200
+MANUAL_LOTS = 4
 
 # ==== Переменные ====
 current_position = None
@@ -43,6 +43,9 @@ morning_forecast_sent = False
 last_intermediate_report = None
 INTERMEDIATE_INTERVAL_HOURS = 3
 
+# Дневник сделок
+trades_today = []
+
 # ==== Telegram ====
 async def send_message(text):
     bot = Bot(
@@ -51,32 +54,6 @@ async def send_message(text):
     )
     await bot.send_message(CHAT_ID, text)
     await bot.session.close()
-
-# ==== Работа с файлом позиции ====
-def save_position(direction, entry_price, tp, sl, lots):
-    data = {
-        "direction": direction,
-        "entry_price": entry_price,
-        "tp": tp,
-        "sl": sl,
-        "lots": lots,
-        "time": datetime.now(moscow_tz).isoformat()
-    }
-    with open(POSITION_FILE, "w") as f:
-        json.dump(data, f)
-
-def load_position():
-    if os.path.exists(POSITION_FILE):
-        with open(POSITION_FILE, "r") as f:
-            try:
-                return json.load(f)
-            except:
-                return None
-    return None
-
-def clear_position():
-    if os.path.exists(POSITION_FILE):
-        os.remove(POSITION_FILE)
 
 # ==== Новости ====
 async def get_news():
@@ -139,7 +116,7 @@ def generate_signal(prices):
 # ==== Ордер ====
 def place_market_order(direction, qty):
     with Client(TINKOFF_TOKEN) as client:
-        resp = client.orders.post_order(
+        return client.orders.post_order(
             figi=TINKOFF_FIGI,
             quantity=qty,
             direction=OrderDirection.ORDER_DIRECTION_BUY if direction == "BUY" else OrderDirection.ORDER_DIRECTION_SELL,
@@ -147,7 +124,6 @@ def place_market_order(direction, qty):
             order_type=OrderType.ORDER_TYPE_MARKET,
             order_id=str(uuid.uuid4())
         )
-        return resp
 
 # ==== Промежуточный отчёт ====
 async def intermediate_report(price):
@@ -175,13 +151,31 @@ async def intermediate_report(price):
             f"Итого портфель: {portfolio_value:.2f} ₽"
         )
 
-# ==== Утренний прогноз ====
-async def morning_forecast(prices):
+# ==== Итог дня ====
+async def daily_report(prices):
+    if not trades_today:
+        trades_text = "Сегодня сделок не было."
+        total_profit = 0
+    else:
+        trades_text = ""
+        total_profit = sum(t["profit"] for t in trades_today)
+        for i, trade in enumerate(trades_today, 1):
+            trades_text += f"{i}. {trade['type']} @ {trade['entry']} → {trade['exit']} → {trade['profit']:.2f} ₽\n"
+
+    rub_balance, cny_balance = get_balances()
+    portfolio_value = rub_balance + cny_balance * prices[-1]
+    percent_change = (total_profit / (portfolio_value - total_profit) * 100) if portfolio_value != total_profit else 0
+
     signal = generate_signal(prices)
     news_text = await get_news()
+
     await send_message(
-        f"🌅 Утренний прогноз по RUB/CNY:\n"
-        f"Сигнал: {signal}\n\n"
+        f"📆 Итоги за {datetime.now(moscow_tz).strftime('%d.%m.%Y')} (RUB/CNY)\n\n"
+        f"Сделок за день: {len(trades_today)}\n"
+        f"Прибыль: {total_profit:.2f} ₽ ({percent_change:.2f}% от портфеля)\n\n"
+        f"Детали сделок:\n{trades_text}\n"
+        f"💰 Итог портфеля: {portfolio_value:.2f} ₽\n\n"
+        f"📊 Прогноз на завтра:\nСигнал: {signal}\n\n"
         f"📰 Новости:\n{news_text}"
     )
 
@@ -190,7 +184,6 @@ def main():
     global current_position, entry_price, take_profit_price, stop_loss_price, last_stop_time
     global morning_forecast_sent, last_intermediate_report
 
-    # Если включена ручная позиция
     if MANUAL_POSITION:
         current_position = MANUAL_DIRECTION
         entry_price = MANUAL_ENTRY_PRICE
@@ -221,13 +214,22 @@ def main():
                 asyncio.run(intermediate_report(price))
                 last_intermediate_report = now
 
-            # Логика сопровождения
+            # Вечерний отчёт
+            if now.hour == 23 and 50 <= now.minute <= 51:
+                asyncio.run(daily_report(prices))
+                trades_today.clear()
+
+            # Сопровождение позиции
             if current_position == "BUY":
                 if price >= take_profit_price:
                     place_market_order("SELL", MANUAL_LOTS)
+                    profit = (take_profit_price - entry_price) * LOT_SIZE_CNY * MANUAL_LOTS
+                    trades_today.append({"type": "BUY", "entry": entry_price, "exit": take_profit_price, "profit": profit})
                     current_position = None
                 elif price <= stop_loss_price:
                     place_market_order("SELL", MANUAL_LOTS)
+                    profit = (stop_loss_price - entry_price) * LOT_SIZE_CNY * MANUAL_LOTS
+                    trades_today.append({"type": "BUY", "entry": entry_price, "exit": stop_loss_price, "profit": profit})
                     current_position = None
                     last_stop_time = now
 
@@ -237,11 +239,21 @@ def main():
                 asyncio.run(send_message(f"[RUB/CNY] 🚀 Стартовый сигнал {signal} @ {price:.5f}"))
                 first_run = False
 
-            # Ждём 15 мин после SL
+            # Ждём после SL
             if last_stop_time and (now - last_stop_time).seconds < 900:
                 continue
 
         time.sleep(60)
+
+# ==== Утренний прогноз ====
+async def morning_forecast(prices):
+    signal = generate_signal(prices)
+    news_text = await get_news()
+    await send_message(
+        f"🌅 Утренний прогноз по RUB/CNY:\n"
+        f"Сигнал: {signal}\n\n"
+        f"📰 Новости:\n{news_text}"
+    )
 
 if __name__ == "__main__":
     main()
