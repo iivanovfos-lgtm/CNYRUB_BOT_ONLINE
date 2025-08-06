@@ -9,7 +9,7 @@ import pytz
 from aiogram import Bot
 from tinkoff.invest import Client, OrderDirection, OrderType, CandleInterval
 
-# ==== Настройки из окружения ====
+# ==== Настройки ====
 TINKOFF_TOKEN = os.getenv("TINKOFF_TOKEN")
 ACCOUNT_ID = os.getenv("ACCOUNT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -17,11 +17,10 @@ CHAT_ID = os.getenv("CHAT_ID")
 TINKOFF_FIGI = os.getenv("TINKOFF_FIGI", "BBG0013HRTL0")  # RUB/CNY
 
 TRADE_LOTS = int(os.getenv("TRADE_LOTS", 1))
-TRADE_RUB_LIMIT = float(os.getenv("TRADE_RUB_LIMIT", 10000))
-LOT_SIZE_CNY = 1000  # 1 лот = 1000 CNY
-TP_PERCENT = 0.5  # Take Profit %
-SL_PERCENT = 0.4  # Stop Loss %
-BROKER_FEE = 0.0005  # 0.05% комиссия
+LOT_SIZE_CNY = 1000
+TP_PERCENT = 0.5
+SL_PERCENT = 0.4
+BROKER_FEE = 0.0005  # 0.05%
 
 moscow_tz = pytz.timezone("Europe/Moscow")
 
@@ -32,6 +31,11 @@ take_profit_price = None
 stop_loss_price = None
 last_stop_time = None
 
+# ==== Для прогнозов и отчётов ====
+morning_forecast_sent = False
+last_intermediate_report = None
+INTERMEDIATE_INTERVAL_HOURS = 3
+
 # ==== Дневная статистика ====
 daily_profit = 0.0
 daily_commission = 0.0
@@ -39,11 +43,13 @@ daily_buy_count = 0
 daily_sell_count = 0
 start_of_day_portfolio_value = None
 
+
 # ==== Telegram ====
 async def send_message(text):
-    bot = Bot(token=TELEGRAM_TOKEN)
+    bot = Bot(token=TELEGRAM_TOKEN, parse_mode="Markdown")
     await bot.send_message(CHAT_ID, text)
     await bot.session.close()
+
 
 # ==== Новости ====
 async def get_news():
@@ -62,6 +68,7 @@ async def get_news():
             continue
     return "\n".join(news_list)
 
+
 # ==== Баланс ====
 def get_balances():
     rub_balance, cny_balance = 0, 0
@@ -74,7 +81,8 @@ def get_balances():
                 cny_balance = float(cur.units)
     return rub_balance, cny_balance
 
-# ==== Текущая цена ====
+
+# ==== Цена ====
 def get_price():
     with Client(TINKOFF_TOKEN) as client:
         now = datetime.now(pytz.UTC)
@@ -88,6 +96,7 @@ def get_price():
             return None
         last = candles.candles[-1]
         return last.close.units + last.close.nano / 1e9
+
 
 # ==== Сигнал ====
 def generate_signal(prices):
@@ -103,6 +112,7 @@ def generate_signal(prices):
             return "SELL"
     return "HOLD"
 
+
 # ==== Ордер ====
 def place_market_order(direction, qty):
     with Client(TINKOFF_TOKEN) as client:
@@ -116,56 +126,29 @@ def place_market_order(direction, qty):
         )
         return resp
 
-# ==== Отчёт после сделки ====
-async def trade_report(trade_type, price, qty, profit, commission):
-    global daily_profit, daily_commission, daily_buy_count, daily_sell_count
+
+# ==== Промежуточный отчёт ====
+async def intermediate_report(price):
     rub_balance, cny_balance = get_balances()
     portfolio_value = rub_balance + cny_balance * price
+    if current_position:
+        floating_profit = (price - entry_price) * LOT_SIZE_CNY * TRADE_LOTS
+        await send_message(
+            f"[RUB/CNY] 📊 Промежуточный отчёт ({datetime.now(moscow_tz).strftime('%H:%M')})\n"
+            f"Текущая цена: {price:.5f}\n"
+            f"Открытая позиция: {current_position} @ {entry_price:.5f}\n"
+            f"Плавающая прибыль: {floating_profit:.2f} ₽\n"
+            f"До TP: {((take_profit_price - price) / price * 100):.2f}%\n"
+            f"До SL: {((price - stop_loss_price) / price * 100):.2f}%\n\n"
+            f"Портфель: {portfolio_value:.2f} ₽"
+        )
+    else:
+        await send_message(
+            f"[RUB/CNY] 📊 Промежуточный отчёт ({datetime.now(moscow_tz).strftime('%H:%M')})\n"
+            f"Открытых позиций нет.\n"
+            f"Портфель: {portfolio_value:.2f} ₽"
+        )
 
-    if trade_type == "BUY":
-        daily_buy_count += 1
-    elif trade_type == "SELL":
-        daily_sell_count += 1
-
-    daily_profit += profit
-    daily_commission += commission
-
-    await send_message(
-        f"[RUB/CNY] ✅ Сделка закрыта\n"
-        f"Тип сделки: {trade_type}\n"
-        f"Цена: {price:.5f}\n"
-        f"Объём: {qty * LOT_SIZE_CNY} ¥\n\n"
-        f"📊 Результат сделки:\n"
-        f"Прибыль: {profit:.2f} ₽\n"
-        f"Доходность по сделке: {(profit / (price * qty * LOT_SIZE_CNY) * 100):.2f}%\n"
-        f"Комиссия: {commission:.2f} ₽\n\n"
-        f"📈 Сводка по дню:\n"
-        f"Накопительный итог: {daily_profit:.2f} ₽ ({(daily_profit / start_of_day_portfolio_value * 100):.2f}%)\n"
-        f"Общая комиссия за день: {daily_commission:.2f} ₽\n"
-        f"Сделок сегодня: BUY — {daily_buy_count} | SELL — {daily_sell_count}\n\n"
-        f"💼 Портфель после сделки:\n"
-        f"RUB: {rub_balance:.2f} ₽\n"
-        f"CNY: {cny_balance:.2f} ¥ (~{cny_balance * price:.2f} ₽)\n"
-        f"Итого: {portfolio_value:.2f} ₽"
-    )
-
-# ==== Ежедневный отчёт ====
-async def daily_report():
-    news_text = await get_news()
-    rub_balance, cny_balance = get_balances()
-    last_price = get_price()
-    portfolio_value = rub_balance + cny_balance * last_price
-    await send_message(
-        f"📊 Ежедневный отчёт по RUB/CNY ({datetime.now(moscow_tz).strftime('%d.%m.%Y')})\n\n"
-        f"💼 Портфель:\n"
-        f"RUB: {rub_balance:.2f} ₽\n"
-        f"CNY: {cny_balance:.2f} ¥ (~{cny_balance * last_price:.2f} ₽)\n"
-        f"Итого: {portfolio_value:.2f} ₽\n\n"
-        f"📈 Доходность за день: {(daily_profit / start_of_day_portfolio_value * 100):.2f}% ({daily_profit:.2f} ₽)\n"
-        f"💸 Комиссия: {daily_commission:.2f} ₽\n"
-        f"Сделок: BUY — {daily_buy_count} | SELL — {daily_sell_count}\n\n"
-        f"📰 Новости:\n{news_text}"
-    )
 
 # ==== Утренний прогноз ====
 async def morning_forecast(prices):
@@ -177,10 +160,12 @@ async def morning_forecast(prices):
         f"📰 Новости:\n{news_text}"
     )
 
+
 # ==== Основной цикл ====
 def main():
     global current_position, entry_price, take_profit_price, stop_loss_price, last_stop_time
-    global daily_profit, daily_commission, daily_buy_count, daily_sell_count, start_of_day_portfolio_value
+    global morning_forecast_sent, last_intermediate_report
+    global start_of_day_portfolio_value
 
     prices = []
     first_run = True
@@ -194,40 +179,35 @@ def main():
             if len(prices) > 60:
                 prices = prices[-60:]
 
-            # Утренний прогноз
-            if now.hour == 9 and now.minute == 55:
+            # ==== Утренний прогноз ====
+            if now.hour == 9 and 55 <= now.minute <= 56 and not morning_forecast_sent:
                 asyncio.run(morning_forecast(prices))
+                morning_forecast_sent = True
 
-            # Ежедневный отчёт
-            if now.hour == 23 and now.minute == 50:
-                asyncio.run(daily_report())
+            if now.hour == 0:
+                morning_forecast_sent = False  # сброс на следующий день
 
+            # ==== Промежуточный отчёт ====
+            if last_intermediate_report is None or (now - last_intermediate_report).seconds >= INTERMEDIATE_INTERVAL_HOURS * 3600:
+                asyncio.run(intermediate_report(price))
+                last_intermediate_report = now
+
+            # ==== Логика сделок ====
             signal = generate_signal(prices)
 
-            # Проверка TP/SL
             if current_position == "BUY":
                 if price >= take_profit_price:
-                    profit = (take_profit_price - entry_price) * TRADE_LOTS * LOT_SIZE_CNY
-                    commission = take_profit_price * TRADE_LOTS * LOT_SIZE_CNY * BROKER_FEE * 2
                     place_market_order("SELL", TRADE_LOTS)
-                    asyncio.run(trade_report("SELL", price, TRADE_LOTS, profit, commission))
                     current_position = None
-                    continue
                 elif price <= stop_loss_price:
-                    profit = (stop_loss_price - entry_price) * TRADE_LOTS * LOT_SIZE_CNY
-                    commission = stop_loss_price * TRADE_LOTS * LOT_SIZE_CNY * BROKER_FEE * 2
                     place_market_order("SELL", TRADE_LOTS)
-                    asyncio.run(trade_report("SELL", price, TRADE_LOTS, profit, commission))
                     current_position = None
                     last_stop_time = now
-                    continue
 
-            # Новый вход
             if first_run:
                 asyncio.run(send_message(f"[RUB/CNY] 🚀 Стартовый сигнал {signal} @ {price:.5f}"))
                 first_run = False
 
-            # Задержка после SL
             if last_stop_time and (now - last_stop_time).seconds < 900:
                 continue
 
@@ -246,6 +226,7 @@ def main():
                     ))
 
         time.sleep(60)
+
 
 if __name__ == "__main__":
     main()
