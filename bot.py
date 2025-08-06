@@ -27,6 +27,12 @@ BROKER_FEE = 0.0005
 moscow_tz = pytz.timezone("Europe/Moscow")
 POSITION_FILE = "open_position.json"
 
+# ==== Ручная настройка стартовой позиции ====
+MANUAL_POSITION = True  # True = бот считает, что позиция уже открыта
+MANUAL_DIRECTION = "BUY"  # BUY или SELL
+MANUAL_ENTRY_PRICE = 11.1200  # Цена входа
+MANUAL_LOTS = 4  # Количество лотов (4001 ¥ ≈ 4 лота по 1000)
+
 # ==== Переменные ====
 current_position = None
 entry_price = None
@@ -37,7 +43,6 @@ morning_forecast_sent = False
 last_intermediate_report = None
 INTERMEDIATE_INTERVAL_HOURS = 3
 
-
 # ==== Telegram ====
 async def send_message(text):
     bot = Bot(
@@ -46,7 +51,6 @@ async def send_message(text):
     )
     await bot.send_message(CHAT_ID, text)
     await bot.session.close()
-
 
 # ==== Работа с файлом позиции ====
 def save_position(direction, entry_price, tp, sl, lots):
@@ -61,7 +65,6 @@ def save_position(direction, entry_price, tp, sl, lots):
     with open(POSITION_FILE, "w") as f:
         json.dump(data, f)
 
-
 def load_position():
     if os.path.exists(POSITION_FILE):
         with open(POSITION_FILE, "r") as f:
@@ -71,11 +74,9 @@ def load_position():
                 return None
     return None
 
-
 def clear_position():
     if os.path.exists(POSITION_FILE):
         os.remove(POSITION_FILE)
-
 
 # ==== Новости ====
 async def get_news():
@@ -94,7 +95,6 @@ async def get_news():
             continue
     return "\n".join(news_list)
 
-
 # ==== Баланс ====
 def get_balances():
     rub_balance, cny_balance = 0, 0
@@ -106,7 +106,6 @@ def get_balances():
             elif cur.currency == "cny":
                 cny_balance = float(cur.units)
     return rub_balance, cny_balance
-
 
 # ==== Цена ====
 def get_price():
@@ -123,7 +122,6 @@ def get_price():
         last = candles.candles[-1]
         return last.close.units + last.close.nano / 1e9
 
-
 # ==== Сигнал ====
 def generate_signal(prices):
     df = pd.DataFrame(prices, columns=["close"])
@@ -138,7 +136,6 @@ def generate_signal(prices):
             return "SELL"
     return "HOLD"
 
-
 # ==== Ордер ====
 def place_market_order(direction, qty):
     with Client(TINKOFF_TOKEN) as client:
@@ -152,13 +149,12 @@ def place_market_order(direction, qty):
         )
         return resp
 
-
 # ==== Промежуточный отчёт ====
 async def intermediate_report(price):
     rub_balance, cny_balance = get_balances()
     portfolio_value = rub_balance + cny_balance * price
     if current_position:
-        floating_profit = (price - entry_price) * LOT_SIZE_CNY * TRADE_LOTS
+        floating_profit = (price - entry_price) * LOT_SIZE_CNY * MANUAL_LOTS
         await send_message(
             f"[RUB/CNY] 📊 Промежуточный отчёт ({datetime.now(moscow_tz).strftime('%H:%M')})\n"
             f"Открытая позиция: {current_position} @ {entry_price:.5f}\n"
@@ -179,7 +175,6 @@ async def intermediate_report(price):
             f"Итого портфель: {portfolio_value:.2f} ₽"
         )
 
-
 # ==== Утренний прогноз ====
 async def morning_forecast(prices):
     signal = generate_signal(prices)
@@ -190,20 +185,18 @@ async def morning_forecast(prices):
         f"📰 Новости:\n{news_text}"
     )
 
-
 # ==== Основной цикл ====
 def main():
     global current_position, entry_price, take_profit_price, stop_loss_price, last_stop_time
     global morning_forecast_sent, last_intermediate_report
 
-    # Восстанавливаем позицию
-    saved_pos = load_position()
-    if saved_pos:
-        current_position = saved_pos["direction"]
-        entry_price = saved_pos["entry_price"]
-        take_profit_price = saved_pos["tp"]
-        stop_loss_price = saved_pos["sl"]
-        print(f"[INFO] Восстановлена позиция: {current_position} @ {entry_price}")
+    # Если включена ручная позиция
+    if MANUAL_POSITION:
+        current_position = MANUAL_DIRECTION
+        entry_price = MANUAL_ENTRY_PRICE
+        take_profit_price = entry_price * (1 + TP_PERCENT / 100)
+        stop_loss_price = entry_price * (1 - SL_PERCENT / 100)
+        print(f"[INFO] Ручная позиция активирована: {current_position} @ {entry_price}")
 
     prices = []
     first_run = True
@@ -231,12 +224,10 @@ def main():
             # Логика сопровождения
             if current_position == "BUY":
                 if price >= take_profit_price:
-                    place_market_order("SELL", TRADE_LOTS)
-                    clear_position()
+                    place_market_order("SELL", MANUAL_LOTS)
                     current_position = None
                 elif price <= stop_loss_price:
-                    place_market_order("SELL", TRADE_LOTS)
-                    clear_position()
+                    place_market_order("SELL", MANUAL_LOTS)
                     current_position = None
                     last_stop_time = now
 
@@ -250,25 +241,7 @@ def main():
             if last_stop_time and (now - last_stop_time).seconds < 900:
                 continue
 
-            # Новый вход
-            signal = generate_signal(prices)
-            if signal == "BUY" and not current_position:
-                qty = TRADE_LOTS
-                order = place_market_order("BUY", qty)
-                if order:
-                    current_position = "BUY"
-                    entry_price = price
-                    take_profit_price = entry_price * (1 + TP_PERCENT / 100)
-                    stop_loss_price = entry_price * (1 - SL_PERCENT / 100)
-                    save_position(current_position, entry_price, take_profit_price, stop_loss_price, qty)
-                    asyncio.run(send_message(
-                        f"[RUB/CNY] 🟢 Открыта BUY @ {price:.5f}\n"
-                        f"TP: {take_profit_price:.5f} | SL: {stop_loss_price:.5f} "
-                        f"(учтена комиссия {BROKER_FEE*100:.2f}%)"
-                    ))
-
         time.sleep(60)
-
 
 if __name__ == "__main__":
     main()
